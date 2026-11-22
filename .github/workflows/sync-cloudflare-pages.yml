@@ -1,1 +1,81 @@
+name: Sync Google Drive Literature Sites to Cloudflare Pages
+
+on:
+  schedule:
+    # Every 3 hours at :15 UTC (right after the :45 and :55 web-builder runs)
+    - cron: '15 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deploy both sites even if no Drive changes are detected'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-literature-pages
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js (for Cloudflare Wrangler)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Restore incremental Drive sync cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dist
+            .sync_state
+          key: drive-pages-cache-${{ github.run_id }}
+          restore-keys: |
+            drive-pages-cache-
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Incrementally sync web assets from Google Drive
+        id: sync
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          FORCE_DEPLOY: ${{ inputs.force_deploy || 'false' }}
+        run: python3 scripts/sync_drive_to_pages.py
+
+      - name: Deploy Literature on Middle East Studies
+        if: steps.sync.outputs.deploy_me == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx --yes wrangler@4 pages project create literature-on-middle-east-studies --production-branch=main || true
+          npx --yes wrangler@4 pages deploy dist/middle_east \
+            --project-name=literature-on-middle-east-studies \
+            --branch=main \
+            --commit-dirty=true
+
+      - name: Deploy Literature on Autism Research
+        if: steps.sync.outputs.deploy_autism == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx --yes wrangler@4 pages project create literature-on-autism-research --production-branch=main || true
+          npx --yes wrangler@4 pages deploy dist/autism \
+            --project-name=literature-on-autism-research \
+            --branch=main \
+            --commit-dirty=true
 
