@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Incrementally sync read-only interactive literature web apps from Google Drive.
+"""Incrementally sync read-only interactive literature web apps from Google Drive (v2).
 
-Designed to scale beyond 100,000+ papers (500+ JSONP static shards per site):
-- Uses Google Drive API v3 with full pagination (pageSize=1000 + nextPageToken).
-- Tracks md5Checksum + modifiedTime in .sync_state/state.json (persisted via actions/cache).
-- Downloads only new or modified files; skips Cloudflare deployment when unchanged.
-- Filters strictly to web runtime assets (HTML shell -> index.html + shards_*/*.js & shard_manifest.json).
+Hardened for 100,000+ papers & zero-maintenance operation:
+- Full Google Drive API v3 pagination (pageSize=1000 + nextPageToken).
+- Syncs strictly runtime files (HTML shell -> index.html + shards_*/*.js; skips shard_manifest.json).
+- Verifies shard completeness against SHELL.cfg (totalDocs/metaCap/sliceCap) to prevent mid-upload tearing.
+- 5-minute Cache-Control with ETag revalidation on *.js so unsealed tail shards never serve stale data.
+- Suppresses redundant GitHub cache writes on no-op runs (refreshes every 4 days before 7-day eviction).
 """
 
 from __future__ import annotations
 
 import base64
-import io
 import json
+import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -24,6 +26,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+CACHE_REFRESH_SECONDS = 4 * 86400  # Refresh cache every 4 days to beat GitHub's 7-day eviction
 
 SITES = [
     {
@@ -87,7 +90,7 @@ def list_folder_files(service: Any, folder_id: str) -> list[dict[str, Any]]:
 
 
 def pick_latest_by_name(files: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Deduplicate by filename, always keeping the newest modifiedTime."""
+    """Deduplicate by filename, keeping the newest modifiedTime."""
     latest: dict[str, dict[str, Any]] = {}
     for f in files:
         if f.get("mimeType") == "application/vnd.google-apps.folder":
@@ -125,6 +128,7 @@ def file_signature(meta: dict[str, Any]) -> str:
 
 
 def write_cloudflare_headers(dist_dir: Path, shards_dir_name: str) -> None:
+    # Both index.html and *.js use 5-min revalidation so mutable tail shards never go stale for 24h
     headers_content = (
         "/*\n"
         "  X-Content-Type-Options: nosniff\n"
@@ -134,13 +138,47 @@ def write_cloudflare_headers(dist_dir: Path, shards_dir_name: str) -> None:
         "/index.html\n"
         "  Cache-Control: public, max-age=300, must-revalidate\n"
         "\n"
-        f"/{shards_dir_name}/shard_manifest.json\n"
-        "  Cache-Control: public, max-age=300, must-revalidate\n"
-        "\n"
         f"/{shards_dir_name}/*.js\n"
-        "  Cache-Control: public, max-age=86400\n"
+        "  Cache-Control: public, max-age=300, must-revalidate\n"
     )
     (dist_dir / "_headers").write_text(headers_content, encoding="utf-8")
+
+
+def verify_shard_completeness(index_path: Path, shards_dir: Path) -> list[str]:
+    """Verify all expected meta and slice shards required by SHELL.cfg exist and are non-empty."""
+    html_text = index_path.read_text(encoding="utf-8")
+    m = re.search(r'const SHELL\s*=\s*(\{"cfg":\s*\{.*?\})', html_text)
+    if not m:
+        m_cfg = re.search(r'"cfg"\s*:\s*(\{[^}]+\})', html_text)
+        if not m_cfg:
+            return []
+        cfg = json.loads(m_cfg.group(1))
+    else:
+        m_cfg = re.search(r'"cfg"\s*:\s*(\{[^}]+\})', m.group(1))
+        cfg = json.loads(m_cfg.group(1)) if m_cfg else {}
+
+    total_docs = int(cfg.get("totalDocs", 0))
+    meta_cap = int(cfg.get("metaCap", 2000))
+    slice_cap = int(cfg.get("sliceCap", 200))
+    prefix = str(cfg.get("prefix", ""))
+    if not total_docs or not prefix:
+        return []
+
+    expected_meta = math.ceil(total_docs / meta_cap)
+    expected_slice = math.ceil(total_docs / slice_cap)
+    missing: list[str] = []
+
+    for i in range(1, expected_meta + 1):
+        fname = f"{prefix}_meta_{str(i).zfill(3)}.js"
+        fpath = shards_dir / fname
+        if not fpath.exists() or fpath.stat().st_size == 0:
+            missing.append(fname)
+    for i in range(1, expected_slice + 1):
+        fname = f"{prefix}_shard_{str(i).zfill(3)}.js"
+        fpath = shards_dir / fname
+        if not fpath.exists() or fpath.stat().st_size == 0:
+            missing.append(fname)
+    return missing
 
 
 def sync_site(service: Any, site: dict[str, Any], prev_state: dict[str, str]) -> tuple[bool, dict[str, str]]:
@@ -150,7 +188,6 @@ def sync_site(service: Any, site: dict[str, Any], prev_state: dict[str, str]) ->
     dist_dir.mkdir(parents=True, exist_ok=True)
     shards_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Locate main HTML shell in topic folder
     topic_files = pick_latest_by_name(list_folder_files(service, site["topic_folder_id"]))
     html_meta = topic_files.get(site["html_filename"])
     if not html_meta:
@@ -158,18 +195,11 @@ def sync_site(service: Any, site: dict[str, Any], prev_state: dict[str, str]) ->
             f"Main HTML file '{site['html_filename']}' not found in folder {site['topic_folder_id']}."
         )
 
-    # 2. List all runtime shard assets (.js + shard_manifest.json)
+    # Strictly sync runtime .js shards (skip shard_manifest.json which the browser never fetches)
     shard_files_all = pick_latest_by_name(list_folder_files(service, site["shards_folder_id"]))
-    shard_files = {
-        name: meta
-        for name, meta in shard_files_all.items()
-        if name.endswith(".js") or name == "shard_manifest.json"
-    }
+    shard_files = {name: meta for name, meta in shard_files_all.items() if name.endswith(".js")}
 
-    # Build desired relative-path -> metadata map
-    desired: dict[str, dict[str, Any]] = {
-        "index.html": html_meta,
-    }
+    desired: dict[str, dict[str, Any]] = {"index.html": html_meta}
     for name, meta in shard_files.items():
         desired[f"{site['shards_dir_name']}/{name}"] = meta
 
@@ -190,7 +220,6 @@ def sync_site(service: Any, site: dict[str, Any], prev_state: dict[str, str]) ->
         downloaded += 1
         changed = True
 
-    # Remove stale shard files that no longer exist in Drive
     expected_shard_names = set(shard_files.keys())
     removed = 0
     for existing in shards_dir.iterdir():
@@ -200,10 +229,17 @@ def sync_site(service: Any, site: dict[str, Any], prev_state: dict[str, str]) ->
             removed += 1
             changed = True
 
-    # Sanity check before deployment
     index_path = dist_dir / "index.html"
     if not index_path.exists() or index_path.stat().st_size < 10_000:
         raise RuntimeError(f"Sanity check failed: {index_path} is missing or unexpectedly small.")
+
+    missing_shards = verify_shard_completeness(index_path, shards_dir)
+    if missing_shards:
+        print(
+            f"  [WARN] Upstream build appears mid-upload; missing shards: {missing_shards}. "
+            "Deferring deployment of this site to next cycle."
+        )
+        return False, prev_state
 
     write_cloudflare_headers(dist_dir, site["shards_dir_name"])
     print(
@@ -229,22 +265,37 @@ def main() -> int:
     creds = load_credentials()
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    all_prev_state: dict[str, dict[str, str]] = {}
+    raw_state: dict[str, Any] = {}
     if STATE_FILE.exists():
         try:
-            all_prev_state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            raw_state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
-            all_prev_state = {}
+            raw_state = {}
 
-    all_new_state: dict[str, dict[str, str]] = {}
+    last_cache_saved = float(raw_state.get("_meta", {}).get("cache_saved_epoch", 0.0))
+    now = time.time()
+
+    all_new_state: dict[str, Any] = {}
     outputs: dict[str, str] = {}
+    any_changed = False
 
     for site in SITES:
         key = site["key"]
-        changed, new_site_state = sync_site(service, site, all_prev_state.get(key, {}))
+        prev_site_state = raw_state.get(key, {})
+        changed, new_site_state = sync_site(service, site, prev_site_state)
         all_new_state[key] = new_site_state
-        should_deploy = changed or force_deploy
+        if changed:
+            any_changed = True
+        should_deploy = (changed or force_deploy) and bool(new_site_state)
         outputs[f"deploy_{key}"] = "true" if should_deploy else "false"
+
+    cache_stale = (now - last_cache_saved) > CACHE_REFRESH_SECONDS
+    save_cache = any_changed or force_deploy or cache_stale
+    outputs["save_cache"] = "true" if save_cache else "false"
+
+    all_new_state["_meta"] = {
+        "cache_saved_epoch": now if save_cache else last_cache_saved,
+    }
 
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(json.dumps(all_new_state, indent=2, sort_keys=True), encoding="utf-8")
