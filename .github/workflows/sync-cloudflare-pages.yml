@@ -2,6 +2,7 @@ name: Sync Google Drive Literature Sites to Cloudflare Pages
 
 on:
   schedule:
+    # Every 3 hours at :15 UTC (right after the :45 and :55 web-builder runs)
     - cron: '15 */3 * * *'
   workflow_dispatch:
     inputs:
