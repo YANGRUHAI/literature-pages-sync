@@ -2,8 +2,8 @@ name: Sync Google Drive Literature Sites to Cloudflare Pages
 
 on:
   schedule:
-    # Every 3 hours at :15 UTC (right after the :45 and :55 web-builder runs)
-    - cron: '15 */3 * * *'
+    # Runs every 3h at :25 UTC (10 mins after the :45/:55 PST web-builder tasks finish around :15 UTC)
+    - cron: '25 */3 * * *'
   workflow_dispatch:
     inputs:
       force_deploy:
@@ -11,6 +11,9 @@ on:
         required: false
         type: boolean
         default: false
+
+permissions:
+  contents: write
 
 concurrency:
   group: sync-literature-pages
@@ -29,14 +32,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
-      - name: Set up Node.js (for Cloudflare Wrangler)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
 
       - name: Restore incremental Drive sync cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             dist
@@ -45,9 +47,6 @@ jobs:
           restore-keys: |
             drive-pages-cache-
 
-      - name: Install Python dependencies
-        run: pip install --no-cache-dir -r requirements.txt
-
       - name: Incrementally sync web assets from Google Drive
         id: sync
         env:
@@ -55,17 +54,32 @@ jobs:
           FORCE_DEPLOY: ${{ inputs.force_deploy || 'false' }}
         run: python3 scripts/sync_drive_to_pages.py
 
+      - name: Set up Node.js (only when deployment is needed)
+        if: steps.sync.outputs.deploy_me == 'true' || steps.sync.outputs.deploy_autism == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Cloudflare Wrangler CLI once
+        if: steps.sync.outputs.deploy_me == 'true' || steps.sync.outputs.deploy_autism == 'true'
+        run: npm install -g wrangler@4
+
       - name: Deploy Literature on Middle East Studies
         if: steps.sync.outputs.deploy_me == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx --yes wrangler@4 pages project create literature-on-middle-east-studies --production-branch=main || true
-          npx --yes wrangler@4 pages deploy dist/middle_east \
+          if ! wrangler pages deploy dist/middle_east \
             --project-name=literature-on-middle-east-studies \
             --branch=main \
-            --commit-dirty=true
+            --commit-dirty=true; then
+            wrangler pages project create literature-on-middle-east-studies --production-branch=main || true
+            wrangler pages deploy dist/middle_east \
+              --project-name=literature-on-middle-east-studies \
+              --branch=main \
+              --commit-dirty=true
+          fi
 
       - name: Deploy Literature on Autism Research
         if: steps.sync.outputs.deploy_autism == 'true'
@@ -73,8 +87,36 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx --yes wrangler@4 pages project create literature-on-autism-research --production-branch=main || true
-          npx --yes wrangler@4 pages deploy dist/autism \
+          if ! wrangler pages deploy dist/autism \
             --project-name=literature-on-autism-research \
             --branch=main \
-            --commit-dirty=true
+            --commit-dirty=true; then
+            wrangler pages project create literature-on-autism-research --production-branch=main || true
+            wrangler pages deploy dist/autism \
+              --project-name=literature-on-autism-research \
+              --branch=main \
+              --commit-dirty=true
+          fi
+
+      - name: Save incremental Drive sync cache (post-deploy atomic commit)
+        if: steps.sync.outputs.save_cache == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            dist
+            .sync_state
+          key: drive-pages-cache-${{ github.run_id }}
+
+      - name: Monthly keepalive to prevent GitHub 60-day schedule auto-disable
+        if: github.event_name == 'schedule'
+        run: |
+          MONTH_TAG=$(date -u +"%Y-%m")
+          CURRENT_TAG=$(cat .keepalive 2>/dev/null || true)
+          if [ "$MONTH_TAG" != "$CURRENT_TAG" ]; then
+            echo "$MONTH_TAG" > .keepalive
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .keepalive
+            git commit -m "chore: monthly schedule keepalive ($MONTH_TAG)" || true
+            git push || echo "[WARN] Keepalive push skipped"
+          fi
